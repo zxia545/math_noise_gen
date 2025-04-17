@@ -28,32 +28,30 @@ logger.info("Starting the script...")
 # ------------------------------------------------------------------------------
 def construct_prompt():
     return (
-        "You are given a math problem and its correct solution. "
-        "that appears plausible but is ultimately incorrect. "
-        "You must ensure the reasoning in your solution closely mimics a real solution's style and structure, "
-        "but contains subtle errors or misleading steps so that the final conclusion is wrong.\n\n"
+        "You are a seasoned mathematics instructor.  "
+        "Whenever asked to generate a “noise solution,” you’ll craft a fully‑worked write‑up "
+        "that mirrors the style and structure of a correct solution but hides at least one "
+        "subtle logical or arithmetic error so the final result is wrong.  "
+        "Your output must be **only** valid JSON with exactly one key: "
+        "`noise_answer_with_steps`."
     )
 
 def construct_user_prompt(question_dict):
     question = question_dict.get('input', '')
-    correct_answer = question_dict.get('answer', '')
-    # correct_explanation = question_dict.get('explanation', '')
-
-    prompt = (
-        f"Math Problem:\n{question}\n\n"
-        f"Correct Solution (for reference only):\n{correct_answer}\n\n"
-        "Now provide a single 'noise solution' that looks similar in structure to the correct solution, "
-        "but is incorrect. Do NOT simply restate the correct solution. "
-        "You must introduce at least one significant error in the calculation or reasoning.\n\n"
-        "Provide a plausible but incorrect 'answer' and a misleading 'explanation' to generate ambiguity for this question. "
-        "Your response must ONLY include the 'answer' and 'explanation' keys formatted as a dictionary.\n\n"
-        "Example:\n"
+    correct   = question_dict["answer"]
+    return (
+        f"Here is the problem and its correct solution (for your reference only):\n\n"
+        f"Problem:\n{question}\n\n"
+        f"Correct Solution:\n{correct}\n\n"
+        "Now provide a single “noise solution” that:\n"
+        "  • Mimics the exact style and structure of the correct write‑up\n"
+        "  • Contains a subtle but significant mistake in reasoning or arithmetic\n"
+        "  • Concludes with a wrong result, yet sounds entirely plausible\n\n"
+        "Respond **only** with JSON of the form:\n"
         "{\n"
-        "  \"answer\": \"your answer\",\n"
-        "  \"explanation\": \"your explanation\"\n"
+        "  \"noise_answer_with_steps\": \"<your full multi‑step write‑up here>\"\n"
         "}"
     )
-    return prompt
 
 def construct_type1_message(question_dict):
     """
@@ -82,7 +80,7 @@ def main():
     parser.add_argument("--gpu", type=int, default=8, help="Number of GPUs for tensor parallel.")
     parser.add_argument("--port", type=int, default=8020, help="Port for the vLLM server.")
     parser.add_argument("--input_jsonl", type=str, default="/home/aiscuser/zhengyu_blob_home/tony_folder/0413_math_with_noise/data/original_good_data/train_math.jsonl", help="Path to the input JSONL file.")
-    parser.add_argument("--threads", type=int, default=60, help="Number of threads for concurrent processing.")
+    parser.add_argument("--threads", type=int, default=1, help="Number of threads for concurrent processing.")
     
 
     args = parser.parse_args()
