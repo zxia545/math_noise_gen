@@ -135,8 +135,16 @@ def main():
             answer = f"[Error calling LLM] {str(e)}"
             logger.error(f"[ERROR] Failed to process record {idx}: {str(e)}")
         logger.info(f"[INFO] Completed record {idx}.")
+        # Make \n to be line in log like using print 
+        logger.warning(f'************************************************************************************************************************************************************************************')
+        logger.warning(f'[INFO] Original question: {question_dict["input"]}')
+        logger.warning(f'------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------')
+        logger.warning(f'[INFO] Original answer: {question_dict["output"]}')
+        logger.warning(f'------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------')
         logger.warning(f'[INFO] Answer for record {idx}: {answer}')
-        print(f"[INFO] Answer for record {idx}: {answer}")
+        logger.warning(f'************************************************************************************************************************************************************************************')
+        print(f"[{idx}] Original question: {question_dict['input']}")
+        print(f"[{idx}] Answer for record: {answer}")
         return {
             "idx": idx,
             "question": record["input"],
