@@ -135,6 +135,8 @@ def main():
             answer = f"[Error calling LLM] {str(e)}"
             logger.error(f"[ERROR] Failed to process record {idx}: {str(e)}")
         logger.info(f"[INFO] Completed record {idx}.")
+        logger.warning(f'[INFO] Answer for record {idx}: {answer}')
+        print(f"[INFO] Answer for record {idx}: {answer}")
         return {
             "idx": idx,
             "question": record["input"],
