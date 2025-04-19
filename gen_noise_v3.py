@@ -82,9 +82,7 @@ def main():
     parser.add_argument("--gpu", type=int, default=8, help="Number of GPUs for tensor parallel.")
     parser.add_argument("--port", type=int, default=8020, help="Port for the vLLM server.")
     parser.add_argument("--input_jsonl", type=str, default="/home/aiscuser/zhengyu_blob_home/tony_folder/0413_math_with_noise/data/original_good_data/train_math.jsonl", help="Path to the input JSONL file.")
-    parser.add_argument("--threads", type=int, default=1, help="Number of threads for concurrent processing.")
-    
-
+    parser.add_argument("--threads", type=int, default=60, help="Number of threads for concurrent processing.")
     args = parser.parse_args()
 
     # Ensure output directory exists
@@ -100,16 +98,8 @@ def main():
     data_list = list(read_jsonl(args.input_jsonl))
     logger.info(f"[INFO] Loaded {len(data_list)} records from {args.input_jsonl}")
     
-        # Load existing output JSONL if it exists
-    if os.path.exists(output_file):
-        logger.info(f"[INFO] Loading existing results from {output_file}")
-        existing_results = list(read_jsonl(output_file))
-        existing_ids = {record["idx"] for record in existing_results}
-        data_list = [record for record in data_list if record.get("idx") not in existing_ids]
-        logger.info(f"[INFO] {len(data_list)} new records will be processed.")
-    else:
-        logger.info(f"[INFO] No existing results found. Processing all records.")
-
+    # 1. Start vLLM server
+    process = start_vllm_server(args.model, args.model_name, args.port, args.gpu)
 
 
     # Prepare for output
@@ -137,21 +127,13 @@ def main():
             answer = f"[Error calling LLM] {str(e)}"
             logger.error(f"[ERROR] Failed to process record {idx}: {str(e)}")
         logger.info(f"[INFO] Completed record {idx}.")
-        # Make \n to be line in log like using print 
-        logger.warning(f'************************************************************************************************************************************************************************************')
-        logger.warning(f'[INFO] Original question: {question_dict["input"]}')
-        logger.warning(f'------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------')
-        logger.warning(f'[INFO] Original answer: {question_dict["output"]}')
-        logger.warning(f'------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------')
-        logger.warning(f'[INFO] Answer for record {idx}: {answer}')
-        logger.warning(f'************************************************************************************************************************************************************************************')
-        print(f"[{idx}] Original question: {question_dict['input']}")
-        print(f"[{idx}] Answer for record: {answer}")
         return {
             "idx": idx,
             "question": record["input"],
             "answer": record["output"],
+            # "explanation": record["explanation"],
             "type": "math",
+            # "question_type": record["question_type"],
             "noise_answer_explanation": answer
         }
 
@@ -162,7 +144,7 @@ def main():
         for i, future in enumerate(futures):
             output_data.append(future.result())
             # Save intermediate results every 2000 records
-            if i % 10 == 0:
+            if i % 2000 == 0:
                 current_time = time.time()
                 save_partial_results()
                 logger.warning(f"[INFO] Processed {i} records in {current_time - pre_time:.2f}s.")
@@ -171,6 +153,9 @@ def main():
     # 4. Save any remaining records
     save_partial_results()
     logger.info(f"[INFO] All records processed. Final output saved to {output_file}")
+
+    # 5. Stop the vLLM server
+    stop_vllm_server(process)
 
 if __name__ == "__main__":
     main()
