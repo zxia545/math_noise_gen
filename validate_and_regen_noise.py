@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import argparse
 import os
 import time
@@ -6,66 +7,99 @@ import logging
 import sys
 import re
 from concurrent.futures import ThreadPoolExecutor
-
 import openai # Assuming chat_completion uses the openai library structure
 
 # --- Assuming these utilities exist from your previous context ---
 # You might need to adjust paths or copy these functions here
+# Ensure read_jsonl can handle potential errors per line gracefully
 from utils import read_jsonl, write_jsonl, start_vllm_server, stop_vllm_server, chat_completion
 # --- End assumed utilities ---
 
 # ------------------------------------------------------------------------------
 # Logging Configuration
 # ------------------------------------------------------------------------------
-# Create a unique log file name including 'validate'
 log_filename = f'validate_regenerate_running_{time.strftime("%d_%H_%M_%S")}.log'
 logging.basicConfig(
     level=logging.INFO,
     filename=log_filename,
-    filemode='a',
+    filemode='a', # Append mode
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-# Also log to console for interactive feedback during validation runs
+# Also log to console for interactive feedback
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
+# Avoid adding handler multiple times if script is re-run in same session
+if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+    logger.addHandler(console_handler)
 
 logger.info(f"Starting the validation and regeneration script. Logging to {log_filename}")
 
 # ------------------------------------------------------------------------------
-# Helper Function to Extract JSON from LLM Output
+# Helper Function to Find and Parse JSON containing a specific key - NEW
 # ------------------------------------------------------------------------------
-def extract_json_from_string(text):
+def find_and_parse_json_obj(s, key_literal):
     """
-    Extracts the first valid JSON object string, handling potential markdown code blocks.
-    Returns the parsed JSON object or None if no valid JSON is found.
+    Finds a JSON object string containing the specified key literal (e.g., '"my_key"')
+    in string s, parses it, and returns the parsed object.
+    Returns the parsed JSON object or None if not found or parsing fails.
     """
-    # Look for JSON within markdown code blocks first
-    match = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL | re.IGNORECASE)
-    if match:
-        json_str = match.group(1)
-    else:
-        # Look for the first '{' and the last '}'
-        start = text.find('{')
-        end = text.rfind('}')
-        if start != -1 and end != -1 and end > start:
-            json_str = text[start:end+1]
-        else:
-            logger.warning(f"Could not find JSON structure in text: {text[:100]}...")
-            return None # No JSON structure found
-
-    try:
-        return json.loads(json_str)
-    except json.JSONDecodeError as e:
-        logger.warning(f"Failed to decode JSON: {e}\nJSON string was: {json_str}")
+    if not isinstance(s, str) or not isinstance(key_literal, str):
+        logger.debug(f"Invalid input type to find_and_parse_json_obj: s={type(s)}, key={type(key_literal)}")
         return None
-    
+
+    idx = s.find(key_literal)
+    if idx == -1:
+        logger.debug(f"Key literal '{key_literal}' not found in string.")
+        return None
+
+    # Find the opening brace '{' before the key
+    start = s.rfind('{', 0, idx)
+    if start == -1:
+        logger.debug(f"Could not find opening brace '{{' before key '{key_literal}'.")
+        return None
+
+    # Scan forward to find the matching closing brace '}' using a stack
+    stack_depth = 0
+    for i in range(start, len(s)):
+        char = s[i]
+        if char == '{':
+            stack_depth += 1
+        elif char == '}':
+            if stack_depth == 0:
+                 # Found closing brace before opening one - malformed?
+                 logger.debug(f"Found closing brace '}}' before matching opening brace, starting search from index {start}.")
+                 return None
+            stack_depth -= 1
+            if stack_depth == 0:
+                # Found the matching closing brace
+                json_str = s[start:i+1]
+                logger.debug(f"Found potential JSON string: {json_str[:100]}...")
+                try:
+                    # Attempt to parse the extracted string
+                    parsed_obj = json.loads(json_str)
+                    # Verify the key actually exists in the parsed object
+                    # Need to remove quotes from key_literal for dict lookup
+                    key_name = key_literal.strip('"')
+                    if key_name in parsed_obj:
+                        logger.debug(f"Successfully parsed JSON containing key '{key_name}'.")
+                        return parsed_obj
+                    else:
+                        logger.warning(f"Parsed JSON object, but key '{key_name}' not found. Object: {parsed_obj}")
+                        # Continue searching? For now, we assume the first found object containing the key literal text is the target.
+                        return None # Treat as not found if key isn't in the final parsed object
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Found JSON string boundaries but failed to parse: {e}\nString was: {json_str}")
+                    return None # Parsing failed
+    # If loop finishes without finding matching brace
+    logger.debug(f"Could not find matching closing brace '}}' for opening brace at index {start}.")
+    return None
+
 
 # ------------------------------------------------------------------------------
-# Prompt Constructors (Original Noise Generation) - Reused from your script
+# Prompt Constructors (Reused - No Changes Needed Here)
 # ------------------------------------------------------------------------------
 def construct_noise_gen_system_prompt():
     return (
@@ -79,8 +113,8 @@ def construct_noise_gen_system_prompt():
     )
 
 def construct_noise_gen_user_prompt(question_dict):
-    question = question_dict.get('question', '') # Adjusted key based on typical structure
-    correct = question_dict.get("answer", '')   # Adjusted key
+    question = question_dict.get('question', '')
+    correct = question_dict.get("answer", '')
     return (
         f"Here is the problem and its correct solution (for your reference only):\n\n"
         f"Problem:\n{question}\n\n"
@@ -104,9 +138,6 @@ def construct_noise_gen_message(question_dict):
         {"role": "user", "content": prompt}
     ]
 
-# ------------------------------------------------------------------------------
-# Prompt Constructors (Noise Validation) - NEW
-# ------------------------------------------------------------------------------
 def construct_validation_system_prompt():
     return (
         "You are a meticulous Math Problem Verifier. Your task is to evaluate a proposed 'noise solution' "
@@ -150,11 +181,12 @@ def construct_validation_message(question, correct_solution, noise_solution_text
         {"role": "user", "content": prompt}
     ]
 
+
 # ------------------------------------------------------------------------------
 # Main Execution
 # ------------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Validate and regenerate noise answers in a JSONL file.")
+    parser = argparse.ArgumentParser(description="Validate and regenerate noise answers in a JSONL file with retries, using key-based JSON finding.")
     parser.add_argument(
         "--input_jsonl",
         type=str,
@@ -170,27 +202,28 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="/path/to/your/model", # <<< IMPORTANT: Set a default or require this
+        required=True, # Make model path required
         help="Path or name of the model for vLLM (used for both validation and regeneration)."
     )
     parser.add_argument("--model_name", type=str, default="validator_regenerator_model", help="Name of the model for vLLM.")
     parser.add_argument("--gpu", type=int, default=8, help="Number of GPUs for tensor parallel.")
     parser.add_argument("--port", type=int, default=8020, help="Port for the vLLM server.")
-    parser.add_argument("--threads", type=int, default=30, help="Number of threads for concurrent processing (adjust based on GPU memory and validation complexity).")
+    parser.add_argument("--threads", type=int, default=30, help="Number of threads for concurrent processing.")
     parser.add_argument("--max_tokens_validate", type=int, default=512, help="Max tokens for the validation response.")
     parser.add_argument("--max_tokens_regenerate", type=int, default=2048, help="Max tokens for regenerated noise.")
     parser.add_argument("--temperature_validate", type=float, default=0.1, help="Temperature for validation (low for consistency).")
     parser.add_argument("--temperature_regenerate", type=float, default=0.7, help="Temperature for regeneration (higher for variability).")
-    parser.add_argument("--save_interval", type=int, default=500, help="Save progress every N records.")
+    parser.add_argument("--save_interval", type=int, default=2000, help="Save progress every N records (default: 2000).")
+    parser.add_argument("--max_retries", type=int, default=3, help="Maximum number of retries for failed LLM calls (default: 3).")
 
     args = parser.parse_args()
 
-    # Ensure output directory exists
+    # --- Ensure output directory exists ---
     if not os.path.exists(args.output_folder_path):
         os.makedirs(args.output_folder_path, exist_ok=True)
         logger.info(f"Created output directory: {args.output_folder_path}")
 
-    # Define output file path
+    # --- Define output file path ---
     base_name = os.path.basename(args.input_jsonl)
     output_file = os.path.join(args.output_folder_path, f'validated_{base_name}')
     logger.info(f'Input file: {args.input_jsonl}')
@@ -199,22 +232,15 @@ def main():
     # --- Check if output file already exists and handle resume ---
     processed_indices = set()
     if os.path.exists(output_file):
-        logger.warning(f"Output file {output_file} already exists. Attempting to resume.")
+        logger.warning(f"Output file {output_file} already exists. Attempting to resume by checking processed indices.")
         try:
-            # Read existing output to find which indices are already processed
-            existing_data = list(read_jsonl(output_file))
-            processed_indices = {record.get("idx") for record in existing_data if "idx" in record}
-            logger.info(f"Resuming. Found {len(processed_indices)} already processed records.")
-            # Keep the existing data in memory to append new results later (if file is not too large)
-            # For very large files, it might be better to always append and handle duplicates post-hoc
-            output_data_list = existing_data
+            for record in read_jsonl(output_file):
+                 idx = record.get("idx")
+                 if idx is not None:
+                     processed_indices.add(idx)
+            logger.info(f"Resuming. Found {len(processed_indices)} unique processed indices in existing output file.")
         except Exception as e:
-            logger.error(f"Error reading existing output file for resuming: {e}. Starting fresh.", exc_info=True)
-            output_data_list = [] # Start fresh if reading fails
-            # Optionally backup the old file here
-            # os.rename(output_file, output_file + f".backup_{time.strftime('%Y%m%d_%H%M%S')}")
-    else:
-        output_data_list = []
+            logger.error(f"Error reading existing output file for resuming: {e}. Indices might be incomplete.", exc_info=True)
 
     # --- Read input data ---
     try:
@@ -222,115 +248,176 @@ def main():
         logger.info(f"Loaded {len(input_data_list)} records from {args.input_jsonl}")
     except Exception as e:
         logger.critical(f"Failed to load input file {args.input_jsonl}: {e}", exc_info=True)
-        sys.exit(1) # Exit if input can't be loaded
+        sys.exit(1)
 
-    # Filter out records that are already processed
+    # Filter out records that are already processed based on index
     records_to_process = [record for record in input_data_list if record.get("idx") not in processed_indices]
-    logger.info(f"Will process {len(records_to_process)} new records.")
-
     if not records_to_process:
-        logger.info("No new records to process. Exiting.")
+        logger.info("No new records to process (all indices found in existing output). Exiting.")
         sys.exit(0)
+    else:
+        logger.info(f"Filtered records. Will process {len(records_to_process)} new records (indices not found in output file).")
+
 
     # --- Start vLLM server ---
     logger.info("Starting vLLM server...")
     process = start_vllm_server(args.model, args.model_name, args.port, args.gpu)
     if not process:
          logger.critical("Failed to start vLLM server. Exiting.")
-         sys.exit(1) # Exit if server fails to start
+         sys.exit(1)
+
+    # --- LLM Call Wrapper with Retry (using new JSON finder) ---
+    def call_llm_with_retry(api_base, model_name, messages, max_tokens, temperature, target_json_key_literal):
+        """
+        Calls the LLM API with retry logic.
+        Uses find_and_parse_json_obj to extract JSON containing target_json_key_literal.
+        Returns the parsed JSON object and the raw response string on success, else (None, None).
+        """
+        raw_response = None # Keep track of the last raw response for regeneration payload
+        for attempt in range(args.max_retries):
+            try:
+                raw_response = chat_completion( # Get the raw string response
+                    api_base=api_base,
+                    model_name=model_name,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature
+                )
+
+                if not raw_response:
+                    logger.warning(f"LLM call attempt {attempt + 1}/{args.max_retries} returned empty response.")
+                    time.sleep(2 ** attempt) # Exponential backoff
+                    continue
+
+                # Use the new function to find and parse the JSON
+                parsed_json = find_and_parse_json_obj(raw_response, target_json_key_literal)
+
+                if parsed_json:
+                    logger.debug(f"LLM call attempt {attempt + 1} successful. Found and parsed JSON containing key {target_json_key_literal}.")
+                    return parsed_json, raw_response # Return parsed object and raw text
+                else:
+                    logger.warning(f"LLM call attempt {attempt + 1}/{args.max_retries}: Could not find/parse JSON with key {target_json_key_literal}. Raw response (start): {raw_response[:200]}...")
+
+            except Exception as e:
+                logger.error(f"LLM call attempt {attempt + 1}/{args.max_retries} failed with exception: {e}", exc_info=True)
+
+            # Wait before retrying
+            if attempt < args.max_retries - 1:
+                wait_time = 2 ** (attempt + 1)
+                logger.info(f"Waiting {wait_time} seconds before retry...")
+                time.sleep(wait_time)
+
+        logger.error(f"LLM call failed after {args.max_retries} attempts for key {target_json_key_literal}.")
+        # Return None for parsed, but potentially return the last raw response seen
+        return None, raw_response
+
 
     # --- Processing Function ---
     def process_record(record):
         idx = record.get("idx", "N/A")
-        question = record.get("question") or record.get("input") # Handle potential key variation
-        correct_answer = record.get("answer") or record.get("output") # Handle potential key variation
-        original_noise_payload = record.get("noise_answer_explanation")
-
-        if not all([question, correct_answer, original_noise_payload]):
-            logger.warning(f"Record {idx}: Missing required fields (question, answer, or noise_answer_explanation). Skipping.")
-            # Return original record structure maybe with an error note
-            return {**record, "validation_status": "skipped_missing_fields", "noise_needs_regeneration": True}
+        question = record.get("question") or record.get("input")
+        correct_answer = record.get("answer") or record.get("output")
+        # original_noise_payload stores the *string* output from the first script,
+        # which might contain JSON or just text.
+        original_noise_payload_str = record.get("noise_answer_explanation")
 
         validation_result = {"is_valid_noise": False, "reason": "Validation not performed"}
-        noise_to_use = original_noise_payload
+        # This will store the string that goes into the final output file's
+        # 'noise_answer_explanation' field. It should ideally be the raw string
+        # containing the JSON object generated by the LLM.
+        final_noise_payload_str = original_noise_payload_str
+        noise_text_to_validate = None
         regenerated = False
+        validation_status = "pending" # pending, success, failed_api, failed_parsing, skipped
 
-        # 1. Extract the actual noise text from the payload (which might be JSON)
-        original_noise_json = extract_json_from_string(original_noise_payload)
-        if original_noise_json and 'noise_answer_with_steps' in original_noise_json:
-            noise_text = original_noise_json['noise_answer_with_steps']
+        # --- Basic Check ---
+        if not all([question, correct_answer]): # Allow missing noise payload initially
+            logger.warning(f"Record {idx}: Missing question or answer. Skipping.")
+            return {**record, "validation_status": "skipped_missing_fields", "noise_needs_regeneration": True} # Mark for regen? Or just skip?
+
+        # --- 1. Extract Noise Text for Validation ---
+        # Try to parse the JSON object containing 'noise_answer_with_steps' from the original payload string
+        noise_key_literal = '"noise_answer_with_steps"' # Key expected in the original payload
+        parsed_original_noise = find_and_parse_json_obj(original_noise_payload_str, noise_key_literal)
+
+        if parsed_original_noise:
+            noise_text_to_validate = parsed_original_noise.get(noise_key_literal.strip('"'))
+            if noise_text_to_validate:
+                 logger.debug(f"Record {idx}: Successfully extracted noise text for validation.")
+            else:
+                 logger.warning(f"Record {idx}: Parsed JSON from original payload, but '{noise_key_literal}' key had no value. Forcing regeneration.")
+                 validation_result = {"is_valid_noise": False, "reason": f"Original noise payload JSON parsed but key '{noise_key_literal}' missing/empty."}
+                 validation_status = "failed_parsing"
         else:
-            # If it's not the expected JSON, treat the whole string as the noise (less ideal)
-            # Or force regeneration if structure is mandatory
-            logger.warning(f"Record {idx}: Could not parse expected JSON from noise_answer_explanation. Treating raw string as noise for validation / forcing regeneration.")
-            noise_text = str(original_noise_payload) # Ensure it's a string
-            # Decide: force regeneration if JSON structure was required by original script?
-            # validation_result = {"is_valid_noise": False, "reason": "Failed to parse noise JSON structure."}
+            # If we couldn't find/parse the specific JSON, maybe the payload is just raw text?
+            # Or maybe it's empty/None. If it's a non-empty string, maybe try validating it?
+            # For now, let's assume failure to find the JSON means regeneration is needed.
+            logger.warning(f"Record {idx}: Could not find/parse JSON object with key {noise_key_literal} in original payload. Forcing regeneration.")
+            validation_result = {"is_valid_noise": False, "reason": f"Original noise payload missing or invalid JSON structure with key {noise_key_literal}."}
+            validation_status = "failed_parsing" # Or maybe "missing_payload" if original_noise_payload_str is None/empty
 
-        # 2. Validate the extracted/original noise text
-        try:
-            logger.debug(f"Record {idx}: Validating noise.")
-            validation_messages = construct_validation_message(question, correct_answer, noise_text)
-            validation_response_raw = chat_completion(
+        # --- 2. Validate (if we have text to validate) ---
+        if noise_text_to_validate:
+            logger.info(f"Record {idx}: Validating noise...")
+            validation_messages = construct_validation_message(question, correct_answer, noise_text_to_validate)
+            validation_key_literal = '"is_valid_noise"' # Key expected from validation LLM
+            validation_response_json, _ = call_llm_with_retry(
                 api_base=f"http://localhost:{args.port}/v1",
                 model_name=args.model_name,
                 messages=validation_messages,
                 max_tokens=args.max_tokens_validate,
-                temperature=args.temperature_validate
+                temperature=args.temperature_validate,
+                target_json_key_literal=validation_key_literal
             )
-            validation_response_json = extract_json_from_string(validation_response_raw)
 
-            if validation_response_json and isinstance(validation_response_json.get("is_valid_noise"), bool):
-                validation_result = validation_response_json
-                logger.info(f"Record {idx}: Validation result: {validation_result['is_valid_noise']}. Reason: {validation_result['reason']}")
+            # Check the parsed JSON result
+            if validation_response_json and isinstance(validation_response_json.get(validation_key_literal.strip('"')), bool):
+                validation_result = validation_response_json # Contains 'is_valid_noise' and 'reason'
+                validation_status = "success"
+                logger.info(f"Record {idx}: Validation result: {validation_result.get('is_valid_noise')}. Reason: {validation_result.get('reason')}")
             else:
-                logger.error(f"Record {idx}: Validation LLM response was not valid JSON or missing 'is_valid_noise'. Response: {validation_response_raw[:200]}...")
-                validation_result = {"is_valid_noise": False, "reason": "Validation LLM failed or gave malformed response."}
+                logger.error(f"Record {idx}: Validation failed after retries (API error or invalid/incomplete JSON response).")
+                validation_result = {"is_valid_noise": False, "reason": "Validation LLM call failed or gave malformed/incomplete JSON response after retries."}
+                validation_status = "failed_api"
 
-        except Exception as e:
-            logger.error(f"Record {idx}: Error during validation LLM call: {e}", exc_info=True)
-            validation_result = {"is_valid_noise": False, "reason": f"Validation Error: {str(e)}"}
-
-        # 3. Regenerate if validation failed
+        # --- 3. Regenerate if Necessary ---
         if not validation_result.get("is_valid_noise"):
-            logger.warning(f"Record {idx}: Noise validation failed or deemed invalid. Regenerating noise.")
+            logger.warning(f"Record {idx}: Noise invalid or validation failed. Attempting regeneration (Reason: {validation_result.get('reason', 'N/A')}).")
             regenerated = True
-            try:
-                # Construct the prompt using original keys expected by generation function
-                gen_question_dict = {"question": question, "answer": correct_answer}
-                regeneration_messages = construct_noise_gen_message(gen_question_dict)
-                new_noise_payload = chat_completion(
-                    api_base=f"http://localhost:{args.port}/v1",
-                    model_name=args.model_name,
-                    messages=regeneration_messages,
-                    max_tokens=args.max_tokens_regenerate,
-                    temperature=args.temperature_regenerate
-                )
-                # Basic check on regenerated payload
-                if not new_noise_payload or not extract_json_from_string(new_noise_payload):
-                     logger.error(f"Record {idx}: Regeneration failed to produce valid JSON payload. Keeping original invalid noise.")
-                     # Keep original noise but mark as failed regeneration
-                     validation_result["reason"] += " | Regeneration attempt failed."
-                else:
-                    noise_to_use = new_noise_payload # Use the newly generated noise
-                    logger.info(f"Record {idx}: Successfully regenerated noise.")
-                    # Optionally: Re-validate the regenerated noise (could double cost/time)
-                    # logger.info(f"Record {idx}: Re-validating regenerated noise...")
-                    # ... re-validation logic ...
+            gen_question_dict = {"question": question, "answer": correct_answer}
+            regeneration_messages = construct_noise_gen_message(gen_question_dict)
+            regeneration_key_literal = '"noise_answer_with_steps"' # Key expected from regeneration LLM
 
-            except Exception as e:
-                logger.error(f"Record {idx}: Error during regeneration LLM call: {e}", exc_info=True)
-                # Keep original noise, but add note about regen failure
-                validation_result["reason"] += f" | Regeneration Error: {str(e)}"
+            # We need the raw response string from the regeneration call to save in the output file
+            new_noise_json, new_noise_payload_str_raw = call_llm_with_retry(
+                api_base=f"http://localhost:{args.port}/v1",
+                model_name=args.model_name,
+                messages=regeneration_messages,
+                max_tokens=args.max_tokens_regenerate,
+                temperature=args.temperature_regenerate,
+                target_json_key_literal=regeneration_key_literal
+            )
 
+            if new_noise_json and new_noise_payload_str_raw:
+                # Success! Update the payload string to be saved.
+                final_noise_payload_str = new_noise_payload_str_raw
+                logger.info(f"Record {idx}: Successfully regenerated noise.")
+                # Optionally re-validate here if desired
+            else:
+                logger.error(f"Record {idx}: Regeneration failed after {args.max_retries} attempts. Keeping original/invalid noise payload string.")
+                validation_result["reason"] += " | Regeneration attempt failed after retries."
+                regenerated = False # Mark as failed
+                # final_noise_payload_str remains the original invalid one
 
-        # 4. Construct final output record
+        # --- 4. Construct Final Output Record ---
         output_record = {
             **record, # Keep all original fields
-            "noise_answer_explanation": noise_to_use, # Use original or regenerated
+            # Save the string payload (either original or the raw response from regen)
+            "noise_answer_explanation": final_noise_payload_str,
             "validation_passed": validation_result.get("is_valid_noise", False),
             "validation_reason": validation_result.get("reason", "Unknown"),
-            "noise_was_regenerated": regenerated
+            "noise_was_regenerated": regenerated,
+            "validation_run_status": validation_status
         }
         return output_record
 
@@ -338,52 +425,44 @@ def main():
     processed_count = 0
     last_save_count = 0
     start_time = time.time()
-
-    # Temporary list to hold results between saves
-    current_batch_results = []
+    results_buffer = [] # Hold results before saving
 
     with ThreadPoolExecutor(max_workers=args.threads) as executor:
-        # Submit tasks
         futures = {executor.submit(process_record, record): record.get("idx") for record in records_to_process}
 
-        for future in futures: # Iterate through submitted futures
+        for future in futures:
             idx = futures[future]
             try:
                 result = future.result()
-                current_batch_results.append(result)
+                results_buffer.append(result)
                 processed_count += 1
 
-                # Log progress periodically
-                if processed_count % 50 == 0: # Log every 50 records
-                     elapsed_time = time.time() - start_time
+                if processed_count % 100 == 0:
+                     current_time = time.time()
+                     elapsed_time = current_time - start_time
                      rate = processed_count / elapsed_time if elapsed_time > 0 else 0
-                     logger.info(f"Progress: Processed {processed_count}/{len(records_to_process)} records. Rate: {rate:.2f} rec/s.")
+                     logger.info(f"Progress: Processed {processed_count}/{len(records_to_process)} records ({len(processed_indices)} skipped). Rate: {rate:.2f} rec/s.")
 
-                # Save intermediate results periodically
-                if processed_count - last_save_count >= args.save_interval:
-                    logger.warning(f"Saving intermediate results ({len(current_batch_results)} records processed in this batch)...")
-                    write_jsonl(output_file, current_batch_results, append=True) # Append to the file
-                    output_data_list.extend(current_batch_results) # Add to in-memory list if resuming correctly
-                    current_batch_results = [] # Clear the batch
+                if processed_count > 0 and processed_count % args.save_interval == 0:
+                    logger.warning(f"Saving intermediate results ({len(results_buffer)} new records)...")
+                    write_jsonl(output_file, results_buffer, append=True)
+                    results_buffer = []
                     last_save_count = processed_count
-                    logger.info(f"Intermediate save complete. Total processed: {processed_count}")
+                    logger.info(f"Intermediate save complete. Total processed this run: {processed_count}")
 
             except Exception as e:
-                logger.error(f"Record {idx}: Critical error processing future: {e}", exc_info=True)
-                # Optionally save a placeholder error record
-                current_batch_results.append({
+                logger.critical(f"Record {idx}: CRITICAL error processing future: {e}", exc_info=True)
+                results_buffer.append({
                     "idx": idx,
-                    "error": f"Failed during processing: {str(e)}",
-                    **records_to_process[processed_count] # Include original data if possible
+                    "error": f"Critical failure during processing: {str(e)}",
+                    "validation_run_status": "critical_error"
                  })
-                processed_count += 1 # Ensure count increments even on error
-
+                processed_count += 1 # Ensure count increments
 
     # --- Save any remaining records ---
-    if current_batch_results:
-        logger.info(f"Saving final batch of {len(current_batch_results)} records...")
-        write_jsonl(output_file, current_batch_results, append=True)
-        # output_data_list.extend(current_batch_results) # Add final batch to in-memory list
+    if results_buffer:
+        logger.info(f"Saving final batch of {len(results_buffer)} records...")
+        write_jsonl(output_file, results_buffer, append=True)
         logger.info(f"Final save complete.")
 
     total_time = time.time() - start_time
